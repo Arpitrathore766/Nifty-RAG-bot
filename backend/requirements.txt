@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+playwright
+beautifulsoup4
+pymongo
+chromadb
+langchain
+langchain-groq            # <--- New provider
+langchain-huggingface     # <--- For open-source embeddings
+sentence-transformers     # <--- Required for local embeddings
+pymupdf
+python-dotenv
+pandas
+requests
