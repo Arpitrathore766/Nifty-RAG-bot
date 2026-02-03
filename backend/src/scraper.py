@@ -1,204 +1,193 @@
 import os
+import time
+import json
 import pandas as pd
 from datetime import datetime
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
 from src.database import save_market_stats, log_ingestion
 from src.vector_store import add_documents
 from langchain_core.documents import Document
-import yfinance as yf # Fallback library
+import yfinance as yf  # Fallback
 
+# --- CONFIGURATION ---
 DATA_DIR = "./data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-async def scrape_nse_data():
-    """Main pipeline function with Fallback."""
-    print("Starting Ingestion Pipeline...")
+def get_driver():
+    """Initializes a Stealth Chrome Driver to bypass NSE Bot Detection."""
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")  # Run in background
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    # Real User-Agent is CRITICAL for NSE
+    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    
+    service = Service(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service, options=chrome_options)
+
+def fetch_nse_api_data(driver, api_url, referer_url):
+    """
+    Fetches JSON data from NSE's internal APIs using Selenium's valid cookies.
+    This mimics clicking the 'Download' button.
+    """
+    try:
+        # 1. Load the page first to establish the Session/Cookies
+        print(f"Connecting to NSE Session via {referer_url}...")
+        driver.get(referer_url)
+        time.sleep(3) # Wait for cookies to set
+
+        # 2. Use JavaScript to fetch the data using the browser's valid session
+        # This bypasses the headers check that blocks standard Python 'requests'
+        script = f"""
+            var callback = arguments[arguments.length - 1];
+            fetch('{api_url}', {{ 
+                headers: {{ 'X-Requested-With': 'XMLHttpRequest' }} 
+            }})
+            .then(response => response.json())
+            .then(data => callback(data))
+            .catch(err => callback(null));
+        """
+        print(f"Fetching API: {api_url}")
+        data = driver.execute_async_script(script)
+        return data
+    except Exception as e:
+        print(f"API Fetch Error: {e}")
+        return None
+
+def process_market_stats(driver):
+    """Scrapes Nifty 50 Stock Prices (Infosys, Reliance, etc.)"""
+    # The API endpoint for the Nifty 50 Table
+    api_url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050"
+    referer = "https://www.nseindia.com/market-data/live-equity-market?symbol=NIFTY%2050"
+    
+    data = fetch_nse_api_data(driver, api_url, referer)
     records = []
     
-    # --- ATTEMPT 1: SCRAPING NSE (With HTTP/1.1 Forced) ---
-    print("Attempting to scrape NSE directly (HTTP/1.1)...")
+    if data and 'data' in data:
+        print(f"SUCCESS: Fetched valid JSON data from NSE.")
+        # NSE JSON structure: {'data': [{'symbol': 'INFY', 'lastPrice': 1600...}, ...]}
+        for item in data['data']:
+            try:
+                # Normalizing the keys
+                records.append({
+                    "SYMBOL": item.get('symbol'),
+                    "OPEN": item.get('open'),
+                    "HIGH": item.get('dayHigh'),
+                    "LOW": item.get('dayLow'),
+                    "LTP": item.get('lastPrice'),
+                    "%CHNG": item.get('pChange'),
+                    "VOLUME": item.get('totalTradedVolume')
+                })
+            except:
+                continue
+    return records
+
+def process_option_chain(driver):
+    """Scrapes Option Chain Data (Just the summary for RAG context)."""
+    api_url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+    referer = "https://www.nseindia.com/option-chain"
+    
+    data = fetch_nse_api_data(driver, api_url, referer)
+    summary_text = ""
+    
+    if data and 'records' in data:
+        # Just grab the timestamp and underlying value for context
+        timestamp = data['records'].get('timestamp')
+        nifty_val = data['records'].get('underlyingValue')
+        summary_text = f"Nifty 50 Option Chain Status ({timestamp}): Underlying Index Value is {nifty_val}. "
+        
+        # Grab a few ATM strikes (simple heuristic: middle of the data array)
+        if 'data' in data['records']:
+            chain = data['records']['data']
+            mid_point = len(chain) // 2
+            # Take 5 rows from the middle
+            for i in range(mid_point - 2, mid_point + 3):
+                row = chain[i]
+                strike = row.get('strikePrice')
+                ce_ltp = row.get('CE', {}).get('lastPrice', 0)
+                pe_ltp = row.get('PE', {}).get('lastPrice', 0)
+                summary_text += f"[Strike: {strike}, Call Price: {ce_ltp}, Put Price: {pe_ltp}] "
+    
+    return summary_text
+
+def fetch_fallback_data():
+    """Uses Yahoo Finance if NSE blocks us."""
+    print("⚠️ NSE Scrape failed. Switching to Yahoo Finance Fallback...")
+    tickers = ["INFY.NS", "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS"]
+    records = []
     try:
-        async with async_playwright() as p:
-            # Force HTTP/1.1 to bypass HTTP2 Protocol Errors
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    '--disable-http2',              # <--- THE KEY FIX
-                    '--ignore-certificate-errors', 
-                    '--disable-blink-features=AutomationControlled',
-                    '--no-sandbox',
-                    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                ]
-            )
-            context = await browser.new_context(ignore_https_errors=True)
-            page = await context.new_page()
-            
-            # Go directly to table page
-            await page.goto("https://www.nseindia.com/market-data/live-equity-market?symbol=NIFTY%2050", timeout=30000)
-            await page.wait_for_selector("table", timeout=10000)
-            
-            html = await page.content()
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # Find table
-            tables = soup.find_all('table')
-            if tables:
-                df = pd.read_html(str(tables[0]))[0]
-                # Cleanup Data
-                required_cols = ['SYMBOL', 'OPEN', 'HIGH', 'LOW', 'LTP', '%CHNG', 'VOLUME']
-                # Basic rename if columns don't match exactly
-                if 'Symbol' in df.columns: df.rename(columns={'Symbol': 'SYMBOL'}, inplace=True)
-                if 'Last Price' in df.columns: df.rename(columns={'Last Price': 'LTP'}, inplace=True)
-                if '% Change' in df.columns: df.rename(columns={'% Change': '%CHNG'}, inplace=True)
+        data = yf.download(tickers, period="1d", progress=False)
+        # Process multi-index dataframe
+        for ticker in tickers:
+            sym = ticker.replace('.NS', '')
+            try:
+                # Robust extraction for different yfinance versions
+                ltp = data['Close'][ticker].iloc[-1]
+                open_val = data['Open'][ticker].iloc[-1]
+                vol = data['Volume'][ticker].iloc[-1]
+                pct_chng = ((ltp - open_val) / open_val) * 100
                 
-                records = df.to_dict('records')
-                print(f"SUCCESS: Scraped {len(records)} stocks from NSE Website.")
-            
-            await browser.close()
-            
+                records.append({
+                    "SYMBOL": sym,
+                    "LTP": round(float(ltp), 2),
+                    "OPEN": round(float(open_val), 2),
+                    "%CHNG": round(float(pct_chng), 2),
+                    "VOLUME": int(vol)
+                })
+            except:
+                continue
+        print(f"SUCCESS: Retrieved {len(records)} stocks from Yahoo Finance.")
     except Exception as e:
-        print(f"Warning: Direct scraping failed ({e}). Switching to Backup Source...")
+        print(f"Fallback Error: {e}")
+    return records
 
-    # --- ATTEMPT 2: BACKUP (YFINANCE) ---
-    # If scraping failed, use this to ensure the database gets populated
-    if not records:
-        print("Fetching data from Backup Source (Yahoo Finance)...")
-        try:
-            # Nifty 50 Tickers (Top 5 for demo speed, or full list)
-            tickers = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS"]
-            data = yf.download(tickers, period="1d", progress=False)
-            
-            # Format into our standard structure
-            for ticker in tickers:
-                try:
-                    # Handle multi-index columns from yfinance
-                    current_price = data['Close'][ticker].iloc[-1]
-                    open_price = data['Open'][ticker].iloc[-1]
-                    vol = data['Volume'][ticker].iloc[-1]
-                    
-                    # Calculate dummy change if previous close is missing
-                    change = round(((current_price - open_price) / open_price) * 100, 2)
-                    
-                    records.append({
-                        "SYMBOL": ticker.replace(".NS", ""),
-                        "LTP": round(current_price, 2),
-                        "%CHNG": change,
-                        "VOLUME": int(vol),
-                        "OPEN": round(open_price, 2),
-                        "HIGH": round(data['High'][ticker].iloc[-1], 2),
-                        "LOW": round(data['Low'][ticker].iloc[-1], 2)
-                    })
-                except Exception:
-                    continue
-            print(f"SUCCESS: Retrieved {len(records)} stocks from Backup.")
-            
-        except Exception as e:
-            print(f"Critical Error: Backup source also failed: {e}")
-
-    # --- SAVE TO DB ---
-    if records:
-        # 1. Save Structured Data for "Top Gainers" math
-        save_market_stats(records)
-        
-        # 2. Save Semantic Data for RAG
-        docs = []
-        for r in records:
-            content = f"Stock: {r.get('SYMBOL')}. Price: {r.get('LTP')}. Change: {r.get('%CHNG')}%. Volume: {r.get('VOLUME')}."
-            docs.append(Document(page_content=content, metadata={"source": "market_live", "type": "structured"}))
-        
-        add_documents(docs)
-    else:
-        print("No data collected.")
-
-    # --- PDF SIMULATION ---
-    print("Checking for PDF announcements...")
-    dummy_pdf_path = os.path.join(DATA_DIR, "reliance_announcement.pdf")
-    if not os.path.exists(dummy_pdf_path):
-         with open(dummy_pdf_path.replace(".pdf", ".txt"), "w") as f:
-            f.write("RELIANCE INDUSTRIES: Board meeting scheduled for Dividend on 2026-01-22.")
+async def scrape_nse_data():
+    """Main Orchestrator."""
+    print("Starting Ingestion Pipeline...")
+    driver = get_driver()
+    all_docs = []
+    market_records = []
     
-    with open(dummy_pdf_path.replace(".pdf", ".txt"), "r") as f:
-        text = f.read()
-    add_documents([Document(page_content=text, metadata={"source": "RELIANCE", "type": "pdf"})])
-
-    log_ingestion({"status": "success", "timestamp": datetime.now()})
-    print("Pipeline Complete.")
-# import os
-# import pandas as pd
-# from datetime import datetime
-# from bs4 import BeautifulSoup
-# from playwright.async_api import async_playwright  # <--- CHANGED to Async
-# from src.database import save_market_stats, log_ingestion
-# from src.vector_store import add_documents
-# from langchain_core.documents import Document
-# import fitz  # PyMuPDF
-
-# DATA_DIR = "./data"
-# os.makedirs(DATA_DIR, exist_ok=True)
-
-# async def scrape_nse_data():  # <--- CHANGED to async def
-#     """Main pipeline function."""
-#     print("Starting Ingestion Pipeline...")
-    
-#     async with async_playwright() as p:  # <--- CHANGED to async with
-#         # Launch browser (headless=True for server)
-#         browser = await p.chromium.launch(headless=True) # <--- AWAIT
-#         page = await browser.new_page() # <--- AWAIT
+    try:
+        # --- 1. MARKET STATS (The Priority) ---
+        print("Attempting to fetch Market Stats...")
+        market_records = process_market_stats(driver)
         
-#         # 1. Scrape Nifty 50 Stats (Gainers/Losers)
-#         print("Scraping Nifty 50 stats...")
-#         try:
-#             await page.goto("https://www.nseindia.com/market-data/live-equity-market?symbol=NIFTY%2050", timeout=60000) # <--- AWAIT
-#             await page.wait_for_selector("table", timeout=10000) # <--- AWAIT
+        # If NSE failed (empty list), trigger Fallback
+        if not market_records:
+            market_records = fetch_fallback_data()
             
-#             # Extract table content
-#             html = await page.content() # <--- AWAIT
-#             soup = BeautifulSoup(html, 'html.parser')
-#             table = soup.find('table', {'id': 'equityStockTable'}) 
-            
-#             # Fallback parsing
-#             if not table:
-#                 table = soup.find_all('table')[0]
-                
-#             df = pd.read_html(str(table))[0]
-            
-#             # Clean Data
-#             df = df[['SYMBOL', 'OPEN', 'HIGH', 'LOW', 'LTP', '%CHNG', 'VOLUME']]
-#             records = df.to_dict('records')
-            
-#             # Store in MongoDB
-#             save_market_stats(records)
-            
-#             # Create Text Summaries for Vector DB
-#             docs = []
-#             for r in records:
-#                 content = f"Stock: {r['SYMBOL']}. Price: {r['LTP']}. Change: {r['%CHNG']}%. Volume: {r['VOLUME']}."
-#                 docs.append(Document(page_content=content, metadata={"source": "nifty_live", "type": "structured"}))
-#             add_documents(docs)
-#             print(f"Scraped and stored {len(records)} stock records.")
-            
-#         except Exception as e:
-#             print(f"Error scraping table: {e}")
+        # --- 2. OPTION CHAIN ---
+        # (Optional: Only if NSE didn't block us on the first call)
+        if market_records: 
+            oc_text = process_option_chain(driver)
+            if oc_text:
+                all_docs.append(Document(page_content=oc_text, metadata={"source": "NSE", "type": "Option Chain"}))
 
-#         # 2. Scrape Corporate Announcements (PDFs)
-#         print("Checking for PDF announcements...")
-#         try:
-#             dummy_pdf_path = os.path.join(DATA_DIR, "reliance_announcement.pdf")
-#             if not os.path.exists(dummy_pdf_path):
-#                 with open(dummy_pdf_path.replace(".pdf", ".txt"), "w") as f:
-#                     f.write("RELIANCE INDUSTRIES: Board meeting scheduled for Dividend on 2026-01-22.")
+        # --- 3. SAVE DATA ---
+        if market_records:
+            # A. Save for "Top Gainers" Tools (MongoDB)
+            save_market_stats(market_records)
             
-#             with open(dummy_pdf_path.replace(".pdf", ".txt"), "r") as f:
-#                 text = f.read()
-                
-#             docs = [Document(page_content=text, metadata={"source": "RELIANCE", "type": "pdf", "date": str(datetime.now().date())})]
-#             add_documents(docs)
+            # B. Save for Chatbot Questions "Price of Infosys" (Vector DB)
+            for r in market_records:
+                # We create a clear sentence so the LLM can read it easily
+                text = f"Stock Update: {r['SYMBOL']}. Current Price (LTP): {r['LTP']}. Percentage Change: {r['%CHNG']}%. Volume: {r['VOLUME']}."
+                all_docs.append(Document(page_content=text, metadata={"source": "market_live", "type": "stock_price"}))
             
-#         except Exception as e:
-#             print(f"Error processing PDFs: {e}")
+            # Add to ChromaDB
+            add_documents(all_docs)
+            print(f"✅ Pipeline Success: Ingested {len(all_docs)} documents.")
+        else:
+            print("❌ Pipeline Failed: No data collected from Primary or Backup sources.")
             
-#         await browser.close() # <--- AWAIT
-
-#     log_ingestion({"status": "success", "timestamp": datetime.now()})
-#     print("Pipeline Complete.")
+        log_ingestion({"status": "success" if market_records else "failed", "timestamp": datetime.now()})
+        
+    except Exception as e:
+        print(f"Critical Error: {e}")
+    finally:
+        driver.quit()

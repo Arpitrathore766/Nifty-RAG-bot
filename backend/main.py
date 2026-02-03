@@ -27,21 +27,33 @@ async def run_pipeline():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/chat", response_model=QueryResponse)
-async def chat(request: QueryRequest):
-    """Chat endpoint for user queries."""
-    try:
-        # LangGraph Input Format: {"messages": [("user", "your query")]}
-        inputs = {"messages": [("user", request.query)]}
+async def chat_endpoint(request: QueryRequest):
+    agent = get_agent_executor()
+    
+    # LangGraph requires input as a "messages" list
+    result = agent.invoke({"messages": [("user", request.query)]})
+    
+    # The final answer is the last message from the AI
+    final_answer = result["messages"][-1].content
+    
+    return QueryResponse(answer=final_answer)
+
+# @app.post("/chat", response_model=QueryResponse)
+# async def chat(request: QueryRequest):
+#     """Chat endpoint for user queries."""
+#     try:
+#         # LangGraph Input Format: {"messages": [("user", "your query")]}
+#         inputs = {"messages": [("user", request.query)]}
         
-        # Invoke the graph
-        result = agent_app.invoke(inputs)
+#         # Invoke the graph
+#         result = agent_app.invoke(inputs)
         
-        # Extract the final response from the last message in the conversation
-        final_answer = result["messages"][-1].content
+#         # Extract the final response from the last message in the conversation
+#         final_answer = result["messages"][-1].content
         
-        return QueryResponse(answer=final_answer)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+#         return QueryResponse(answer=final_answer)
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

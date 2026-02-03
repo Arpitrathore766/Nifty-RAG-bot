@@ -4,6 +4,18 @@ from src.vector_store import get_vector_store
 import random
 
 @tool
+def search_market_documents(query: str):
+    """
+    Searches for corporate announcements, reports, and specific stock news.
+    Useful when you need to find qualitative info about a company.
+    """
+    retriever = get_rag_retriever_tool()
+    docs = retriever.invoke(query)
+    
+    # Format the documents into a string for the LLM
+    return "\n\n".join([f"[Source: {d.metadata.get('source', 'Unknown')}] {d.page_content}" for d in docs])
+
+@tool
 def get_top_gainers_losers(query: str):
     """
     Useful for answering questions about top gainers, losers, or worst performers.
