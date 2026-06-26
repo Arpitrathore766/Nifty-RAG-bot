@@ -43,13 +43,11 @@ python -m venv venv
 # Mac/Linux:
 source venv/bin/activate
 
-# Install libraries
-pip install -r requirements.txt
 
 # Install Playwright browsers (Required for scraping)
 playwright install chromium
 3. Configuration (.env)
-Create a .env file in the root directory:
+Create a .env file in the backend/ directory and add your Groq API key:
 # API Keys
 GROQ_API_KEY=gsk_your_groq_api_key_here
 
@@ -63,6 +61,7 @@ You will need two terminal windows to run the full application.
 Terminal 1: Start Backend (FastAPI)
 Bash
 cd backend
+pip install -r requirements.txt
 python main.py
 The API will start at http://localhost:8000.
 
@@ -76,7 +75,12 @@ curl.exe -X POST http://localhost:8000/run-ingestion
 curl -X POST http://localhost:8000/run-ingestion
 Wait for the "Pipeline Complete" message in Terminal 1.
 
-Just Click on try it out and ask any question
+##### #######################################
+
+Open your browser and navigate to: http://localhost:8000/docs
+Scroll to the POST /chat endpoint and click "Try it out".
+Paste a JSON query to test the agent's decision-making:
+
 
 
 ##### No need ###############################

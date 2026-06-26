@@ -12,3 +12,7 @@ pymupdf
 python-dotenv
 pandas
 requests
+selenium
+langchain_chroma
+webdriver_manager
+yfinance
