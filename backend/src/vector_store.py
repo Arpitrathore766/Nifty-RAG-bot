@@ -14,8 +14,13 @@ def get_vector_store():
         persist_directory=PERSIST_DIRECTORY
     )
     return vector_store
-
+    
 def add_documents(documents):
     vs = get_vector_store()
+    # Wipe the existing data to prevent stale RAG retrieval
+    vs.delete_collection()
+    
+    # Re-initialize the clean collection
+    vs = get_vector_store() 
     vs.add_documents(documents)
     print(f"Added {len(documents)} chunks to Vector DB.")
