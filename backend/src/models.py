@@ -6,10 +6,22 @@ from datetime import datetime
 # Used by FastAPI in main.py
 class QueryRequest(BaseModel):
     query: str = Field(..., description="The user's question about Nifty 50 data.")
+    session_id: str = Field(default="default", description="Session ID to persist chat history.")
 
 class QueryResponse(BaseModel):
     answer: str
+    session_id: str
     timestamp: datetime = Field(default_factory=datetime.now)
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+    timestamp: datetime
+
+class SessionInfo(BaseModel):
+    session_id: str
+    last_active: datetime
+    message_count: int
 
 # --- Database / Scraping Models ---
 # Used to validate scraped data before inserting into MongoDB
